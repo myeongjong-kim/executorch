@@ -207,6 +207,27 @@ std::unique_ptr<TextLLMRunner> create_text_llm_runner(
       load_mode);
 }
 
+// ============================================================================
+// [한글 주석] create_text_llm_runner() — TextLLMRunner 팩토리 함수
+// ============================================================================
+// 모든 컴포넌트를 생성하고 의존성을 주입하여 TextLLMRunner를 조립
+//
+// [생성되는 컴포넌트와 소유권]
+//   Module(unique_ptr) ─── TextLLMRunner가 소유
+//     ↓ (raw ptr)
+//   IOManager(unique_ptr) ─── TextLLMRunner가 소유
+//     ↓ (raw ptr)
+//   TextDecoderRunner(unique_ptr) ─── TextLLMRunner가 소유
+//     ↓ (raw ptr)            ↓ (raw ptr)
+//   TextPrefiller(unique_ptr)  TextTokenGenerator(unique_ptr)
+//     └── TextLLMRunner 소유    └── TextLLMRunner 소유
+//
+// [예시 가정값]
+//   model_path = "llama2.pte"
+//   tokenizer: SentencePiece, vocab_size=32000
+//   load_mode = MmapUseMlockIgnoreErrors
+//   method_name = "forward"
+//   temperature = 0.8
 std::unique_ptr<TextLLMRunner> create_text_llm_runner(
     const std::string& model_path,
     std::unique_ptr<::tokenizers::Tokenizer> tokenizer,
@@ -215,13 +236,17 @@ std::unique_ptr<TextLLMRunner> create_text_llm_runner(
     std::unique_ptr<::executorch::runtime::EventTracer> event_tracer,
     const std::string& method_name,
     Module::LoadMode load_mode) {
-  // Sanity check tokenizer
+
+  // [1] 토크나이저 유효성 검사
   if (!tokenizer || !tokenizer->is_loaded()) {
     ET_LOG(Error, "Tokenizer is null or not loaded");
     return nullptr;
   }
 
-  // Create the Module
+  // [2] Module 생성 — .pte 모델 파일 로딩 준비
+  // Module은 ExecuTorch의 Program(모델)을 감싸는 래퍼 클래스
+  // MmapUseMlockIgnoreErrors: mmap으로 파일 매핑 + mlock 시도 (실패 시 무시)
+  // data_files: 외부 가중치 파일(.ptd) — 보통 빈 벡터
   std::unique_ptr<Module> module;
   if (data_files.size() > 0) {
     module = std::make_unique<Module>(
@@ -231,7 +256,15 @@ std::unique_ptr<TextLLMRunner> create_text_llm_runner(
         model_path, load_mode, std::move(event_tracer));
   }
 
-  // Get metadata from Module
+  // [3] 모델 메타데이터 추출
+  // .pte 파일에 직렬화된 메타데이터 메서드를 실행하여 설정값 읽기
+  // 예시 결과:
+  //   get_max_seq_len = 2048
+  //   get_max_context_len = 2048
+  //   use_kv_cache = 1 (true)
+  //   enable_dynamic_shape = 1 (true → parallel prefill 가능)
+  //   use_sdpa_with_kv_cache = 0 (false)
+  //   get_bos_id = 1, get_vocab_size = 32000
   ET_LOG(Info, "Reading metadata from model");
   auto metadata_result = llm::get_llm_metadata(tokenizer.get(), module.get());
   if (metadata_result.error() != Error::Ok) {
@@ -240,34 +273,57 @@ std::unique_ptr<TextLLMRunner> create_text_llm_runner(
   }
   auto metadata = metadata_result.get();
 
+  // [4] EOS 토큰 ID 집합 추출
+  // 모델의 get_eos_ids 메서드 실행 → {2}
+  // 없으면 토크나이저의 기본 eos_tok 사용
   auto eos_ids = std::make_unique<std::unordered_set<uint64_t>>(
       llm::get_eos_ids(tokenizer.get(), module.get()));
 
-  // Create IOManager
+  // [5] IOManager 생성
+  // 기본 CPU IOManager: prepare_decode/prefill에서 입력을 그대로 전달
+  // 커스텀 백엔드(GPU 등)는 파생 클래스로 구현
   std::unique_ptr<IOManager> io_manager = std::make_unique<IOManager>(*module);
 
-  // Create text_decoder_runner
+  // [6] TextDecoderRunner 생성
+  // Module과 IOManager의 원시 포인터를 참조 (소유하지 않음)
+  // 역할: step() 메서드로 모델 forward pass 1회 실행
   ET_LOG(Info, "Using method: %s", method_name.c_str());
   auto text_decoder_runner = std::make_unique<TextDecoderRunner>(
-      module.get(), io_manager.get(), method_name);
+      module.get(),       // Module* — module이 먼저 파괴되면 안 됨
+      io_manager.get(),   // IOManager*
+      method_name);       // "forward"
 
-  // Create text_prefiller
+  // [7] TextPrefiller 생성
+  // 역할: 프롬프트 토큰들을 모델에 입력하여 KV 캐시를 채움
+  // use_kv_cache=true: KV 캐시 사용
+  // enable_parallel_prefill=true (=enable_dynamic_shape): 토큰을 한 번에 처리
+  // max_seq_len=2048: 한 번에 처리할 수 있는 최대 토큰 수
   auto text_prefiller = std::make_unique<TextPrefiller>(
-      text_decoder_runner.get(),
-      metadata.at(kUseKVCache),
-      metadata.at(kEnableDynamicShape),
-      metadata.at(kMaxSeqLen));
+      text_decoder_runner.get(),           // TextDecoderRunner* (비소유)
+      metadata.at(kUseKVCache),            // true
+      metadata.at(kEnableDynamicShape),    // true (parallel prefill)
+      metadata.at(kMaxSeqLen));            // 2048
 
-  // Create text_token_generator with stats
+  // [8] Stats & TextTokenGenerator 생성
+  // Stats: 성능 측정 (모델 로드 시간, prefill 시간, 생성 시간 등)
+  // TextTokenGenerator: 자기회귀 토큰 생성 루프
+  //   - tokenizer: 토큰→텍스트 변환용
+  //   - text_decoder_runner: 매 반복 모델 실행용
+  //   - eos_ids: {2} — 이 토큰이 생성되면 루프 종료
   auto stats = std::make_unique<Stats>();
   auto text_token_generator = std::make_unique<TextTokenGenerator>(
-      tokenizer.get(),
-      text_decoder_runner.get(),
-      metadata.at(kUseKVCache),
-      std::move(eos_ids),
-      stats.get());
+      tokenizer.get(),              // Tokenizer* (비소유)
+      text_decoder_runner.get(),    // TextDecoderRunner* (비소유)
+      metadata.at(kUseKVCache),     // true
+      std::move(eos_ids),           // {2} — 소유권 이전
+      stats.get());                 // Stats* (비소유)
 
-  // Create and return the Runner instance
+  // [9] TextLLMRunner 조립 — 모든 unique_ptr 소유권 이전
+  // TextLLMRunner가 모든 컴포넌트의 생명주기를 관리
+  // 멤버 선언 순서에 따라 파괴 순서가 결정됨:
+  //   stats_ → text_token_generator_ → io_manager_ →
+  //   text_prefiller_ → text_decoder_runner_ → module_ →
+  //   metadata_ → tokenizer_
   return std::make_unique<TextLLMRunner>(
       std::move(metadata),
       std::move(tokenizer),
